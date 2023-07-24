@@ -1,73 +1,94 @@
 { lib
 , stdenv
-, fetchzip
-, makeWrapper
-, which
+, fetchFromGitHub
+, gitMinimal
+, cacert
+, yarn
+, makeBinaryWrapper
 , nodejs
-, mkYarnPackage
-, fetchYarnDeps
+, nodePackages
 , python3
 , nixosTests
-}:
+}: let
 
-mkYarnPackage rec {
+  version = "1.9.8";
+
+  src = fetchFromGitHub {
+    owner = "hedgedoc";
+    repo = "hedgedoc";
+    rev = version;
+    hash = "sha256-gp1TeYHwH7ffaSMifdURb2p+U8u6Xs4JU4b4qACEIDw=";
+  };
+
+  offlineCache = stdenv.mkDerivation {
+    name = "hedgedoc-${version}-offline-cache";
+    inherit src;
+
+    nativeBuildInputs = [
+      cacert # needed for git
+      gitMinimal # needed for a dep
+      nodePackages.npm # needed for a dep
+      yarn
+    ];
+
+    HOME = "$TMPDIR";
+    buildPhase = ''
+      yarn config set enableTelemetry 0
+      yarn config set cacheFolder $out
+      yarn
+    '';
+
+    outputHashMode = "recursive";
+    outputHash = "sha256-4TPc9J9u0rO9WfZVbFWwVAM5WY3n5zJdhIlNYiZNRoM=";
+  };
+
+in stdenv.mkDerivation rec {
   pname = "hedgedoc";
-  version = "1.9.7";
+  inherit version src;
 
-  # we use the upstream compiled js files because yarn2nix cannot handle different versions of dependencies
-  # in development and production and the web assets muts be compiled with js-yaml 3 while development
-  # uses js-yaml 4 which breaks the text editor
-  src = fetchzip {
-    url = "https://github.com/hedgedoc/hedgedoc/releases/download/${version}/hedgedoc-${version}.tar.gz";
-    hash = "sha256-tPkhnnKDS5TICsW66YCOy7xWFj5usLyDMbYMYQ3Euoc=";
-  };
+  nativeBuildInputs = [
+    makeBinaryWrapper
+    yarn
+    python3 # needed for sqlite node-gyp
+  ];
 
-  nativeBuildInputs = [ which makeWrapper ];
-  extraBuildInputs = [ python3 ];
+  dontConfigure = true;
 
-  packageJSON = ./package.json;
-  yarnFlags = [ "--production" ];
-
-  offlineCache = fetchYarnDeps {
-    yarnLock = src + "/yarn.lock";
-    sha256 = "0qkc26ks33vy00jgpv4445wzgxx1mzi70pkm1l8y9amgd9wf9aig";
-  };
-
-  configurePhase = ''
-    cp -r "$node_modules" node_modules
-    chmod -R u+w node_modules
-  '';
-
+  HOME = "$TMPDIR";
   buildPhase = ''
     runHook preBuild
 
-    pushd node_modules/sqlite3
+    yarn config set enableTelemetry 0
+    yarn config set cacheFolder ${offlineCache}
+
+    # This will fail but create the sqlite3 files we can patch
+    yarn --immutable-cache || :
+
+    # Ensure we don't download any node things
+    sed -i 's:--fallback-to-build:--build-from-source --nodedir=${nodejs}/include/node:g' node_modules/sqlite3/package.json
     export CPPFLAGS="-I${nodejs}/include/node"
-    npm run install --build-from-source --nodedir=${nodejs}/include/node
-    popd
+
+    # Perform the actual install
+    yarn --immutable-cache
+    yarn run build
 
     patchShebangs bin/*
 
     runHook postBuild
   '';
 
-  dontInstall = true;
-
-  distPhase = ''
-    runHook preDist
+  installPhase = ''
+    runHook preInstall
 
     mkdir -p $out
     cp -R {app.js,bin,lib,locales,node_modules,package.json,public} $out
 
-    cat > $out/bin/hedgedoc <<EOF
-      #!${stdenv.shell}/bin/sh
-      ${nodejs}/bin/node $out/app.js
-    EOF
-    chmod +x $out/bin/hedgedoc
-    wrapProgram $out/bin/hedgedoc \
+    makeWrapper ${nodejs}/bin/node $out/bin/hedgedoc \
+      --add-flags $out/app.js \
+      --set NODE_ENV production \
       --set NODE_PATH "$out/lib/node_modules"
 
-    runHook postDist
+    runHook postInstall
   '';
 
   passthru = {
